@@ -1,0 +1,2 @@
+# kncrud
+knative resource crud
