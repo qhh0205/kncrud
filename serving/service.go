@@ -2,12 +2,19 @@ package serving
 
 import (
 	"flag"
+	"fmt"
+	"path/filepath"
+	"strconv"
+	"time"
 
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
-	servinglib "knative.dev/client/pkg/serving"
-	"knative.dev/client/pkg/util"
+	"k8s.io/client-go/util/homedir"
+	"knative.dev/pkg/ptr"
+	"knative.dev/serving/pkg/apis/autoscaling"
 	servingv1 "knative.dev/serving/pkg/apis/serving/v1"
 	servingclient "knative.dev/serving/pkg/client/clientset/versioned"
 )
@@ -15,11 +22,17 @@ import (
 var knClientset *servingclient.Clientset
 
 func init() {
-	var kubeconfig string
-	flag.StringVar(&kubeconfig, "kubeconfig", "/Users/qianghaohao/.kube/config", "path to Kubernetes config file")
+	var kubeconfig *string
+	if home := homedir.HomeDir(); home != "" {
+		kubeconfig = flag.String("kubeconfig",
+			filepath.Join(home, ".kube", "config"),
+			"(optional) absolute path to the kubeconfig file")
+	} else {
+		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+	}
 	flag.Parse()
 
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -35,7 +48,7 @@ type ServiceConfiguration struct {
 	// Direct field manipulation
 	Name  string
 	Image string
-	Env   []string
+	Envs  map[string]string
 
 	MinScale          int
 	MaxScale          int
@@ -43,55 +56,11 @@ type ServiceConfiguration struct {
 	ConcurrencyLimit  int
 }
 
-// Apply Apply config
-func (p *ServiceConfiguration) Apply(service *servingv1.Service) error {
-	template := &service.Spec.Template
-	err := servinglib.UpdateImage(template, p.Image)
-	if err != nil {
-		return err
-	}
-
-	envMap, err := util.MapFromArrayAllowingSingles(p.Env, "=")
-	if err != nil {
-		return err
-	}
-	envToRemove := util.ParseMinusSuffix(envMap)
-	err = servinglib.UpdateEnvVars(template, envMap, envToRemove)
-	if err != nil {
-		return err
-	}
-
-	err = servinglib.UpdateMinScale(template, p.MinScale)
-	if err != nil {
-		return err
-	}
-
-	err = servinglib.UpdateMaxScale(template, p.MaxScale)
-	if err != nil {
-		return err
-	}
-
-	err = servinglib.UpdateConcurrencyTarget(template, p.ConcurrencyTarget)
-	if err != nil {
-		return err
-	}
-
-	err = servinglib.UpdateConcurrencyLimit(template, int64(p.ConcurrencyLimit))
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // CreateService  create kantive service
 func CreateService(serviceconfig ServiceConfiguration, namespace string) error {
 	client := knClientset.ServingV1().Services(namespace)
-	service, err := constructService(serviceconfig, namespace)
-	if err != nil {
-		return err
-	}
-	_, err = client.Create(service)
+	service := constructService(serviceconfig, namespace)
+	_, err := client.Create(service)
 	if err != nil {
 		return err
 	}
@@ -101,51 +70,87 @@ func CreateService(serviceconfig ServiceConfiguration, namespace string) error {
 // UpdateService  delete kantive service
 func UpdateService(serviceconfig ServiceConfiguration, namespace string) error {
 	client := knClientset.ServingV1().Services(namespace)
+	retries := 0
+	nrRetries := 3
+	for {
+		service, err := client.Get(serviceconfig.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		updatedService := service.DeepCopy()
+		envVars := map2ContainerEnvVar(serviceconfig.Envs)
+		updatedTemplate := &updatedService.Spec.Template
+		updatedTemplate.Spec.Containers[0].Image = serviceconfig.Image
+		updatedTemplate.Spec.Containers[0].Env = envVars
+		updatedTemplate.Annotations[autoscaling.MaxScaleAnnotationKey] = strconv.Itoa(serviceconfig.MaxScale)
+		updatedTemplate.Annotations[autoscaling.MinScaleAnnotationKey] = strconv.Itoa(serviceconfig.MinScale)
+		updatedTemplate.Annotations[autoscaling.TargetAnnotationKey] = strconv.Itoa(serviceconfig.ConcurrencyTarget)
+		updatedTemplate.Spec.ContainerConcurrency = ptr.Int64(int64(serviceconfig.ConcurrencyLimit))
 
-	service, err := client.Get(serviceconfig.Name, metav1.GetOptions{})
-	if err != nil {
-		return err
+		_, err = client.Update(updatedService)
+		if err != nil {
+			if apierrors.IsConflict(err) && retries < nrRetries {
+				retries++
+				// Wait a second before doing the retry
+				time.Sleep(time.Second)
+				continue
+			}
+			return errors.Wrap(err, fmt.Sprintf("giving up after %d retries", nrRetries))
+		}
+		return nil
 	}
-	updatedService := service.DeepCopy()
-	serviceconfig.Apply(updatedService)
-	if err != nil {
-		return err
-	}
-	_, err = client.Update(updatedService)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // DeleteService delete ksvc
 func DeleteService(name string, namespace string) error {
 	client := knClientset.ServingV1().Services(namespace)
-	err := client.Delete(name, &metav1.DeleteOptions{})
+	deletePolicy := metav1.DeletePropagationForeground
+	err := client.Delete(name, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func constructService(serviceconfig ServiceConfiguration, namespace string) (*servingv1.Service,
-	error) {
-	service := servingv1.Service{
+func constructService(serviceconfig ServiceConfiguration, namespace string) *servingv1.Service {
+	envVars := map2ContainerEnvVar(serviceconfig.Envs)
+	return &servingv1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      serviceconfig.Name,
 			Namespace: namespace,
 		},
+		Spec: servingv1.ServiceSpec{
+			ConfigurationSpec: servingv1.ConfigurationSpec{
+				Template: servingv1.RevisionTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							autoscaling.MaxScaleAnnotationKey: strconv.Itoa(serviceconfig.MaxScale),
+							autoscaling.MinScaleAnnotationKey: strconv.Itoa(serviceconfig.MinScale),
+							autoscaling.TargetAnnotationKey:   strconv.Itoa(serviceconfig.ConcurrencyTarget),
+						},
+					},
+					Spec: servingv1.RevisionSpec{
+						ContainerConcurrency: ptr.Int64(int64(serviceconfig.ConcurrencyLimit)),
+						PodSpec: corev1.PodSpec{
+							Containers: []corev1.Container{
+								{
+									Image: serviceconfig.Image,
+									Env:   envVars,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
+}
 
-	service.Spec.Template = servingv1.RevisionTemplateSpec{
-		Spec:       servingv1.RevisionSpec{},
-		ObjectMeta: metav1.ObjectMeta{},
+// map2ContainerEnvVar map 转换为容器环境变量列表 key: Nmae, value: Value
+func map2ContainerEnvVar(m map[string]string) []corev1.EnvVar {
+	var envVars []corev1.EnvVar
+	for k, v := range m {
+		envVars = append(envVars, corev1.EnvVar{Name: k, Value: v})
 	}
-	service.Spec.Template.Spec.Containers = []corev1.Container{{}}
-
-	err := serviceconfig.Apply(&service)
-	if err != nil {
-		return nil, err
-	}
-	return &service, nil
+	return envVars
 }
